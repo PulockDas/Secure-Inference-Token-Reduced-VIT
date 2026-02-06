@@ -263,7 +263,7 @@ def get_dataloaders(
 def get_lc25000_root() -> str:
     """
     Download LC25000 (lung/colon cancer) via kagglehub and return the dataset root.
-    For use in Colab or any environment with Kaggle credentials.
+    Public dataset; no auth needed.
     Root is the directory that contains lung_image_sets and colon_image_sets
     (use with subdir_depth=2 in ImageDataset / get_dataloaders).
     """
