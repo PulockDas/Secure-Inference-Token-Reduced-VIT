@@ -1,0 +1,19 @@
+{
+  "test_acc": 0.9992,
+  "per_class_acc": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.996
+  ],
+  "class_names": [
+    "colon_aca",
+    "colon_n",
+    "lung_aca",
+    "lung_n",
+    "lung_scc"
+  ],
+  "total_samples": 3750,
+  "correct_predictions": 3747
+}
