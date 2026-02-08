@@ -4,6 +4,7 @@ Evaluation: load best checkpoint and report test-set classification results.
 """
 
 import csv
+import json
 import time
 from pathlib import Path
 from typing import Dict, Optional
@@ -131,8 +132,12 @@ def evaluate_teacher(
     test_loader: DataLoader,
     device: torch.device,
     class_names: list,
+    results_dir: Optional[str] = None,
 ) -> Dict:
-    """Evaluate teacher on test set. Returns dict with test_acc and per_class_acc."""
+    """
+    Evaluate teacher on test set. Returns dict with test_acc and per_class_acc.
+    Optionally saves results to results_dir/teacher/ directory.
+    """
     model.eval()
     correct = 0
     total = 0
@@ -155,4 +160,38 @@ def evaluate_teacher(
         class_correct[c] / class_total[c] if class_total[c] > 0 else 0
         for c in range(num_classes)
     ]
-    return {"test_acc": test_acc, "per_class_acc": per_class_acc, "class_names": class_names}
+    result = {"test_acc": test_acc, "per_class_acc": per_class_acc, "class_names": class_names}
+    
+    # Save results to file if results_dir is provided
+    if results_dir:
+        results_path = Path(results_dir) / "teacher"
+        results_path.mkdir(parents=True, exist_ok=True)
+        
+        # Save JSON file with all results
+        json_path = results_path / "evaluation_results.json"
+        json_result = {
+            "test_acc": float(test_acc),
+            "per_class_acc": [float(acc) for acc in per_class_acc],
+            "class_names": class_names,
+            "total_samples": int(total),
+            "correct_predictions": int(correct),
+        }
+        with open(json_path, "w") as f:
+            json.dump(json_result, f, indent=2)
+        
+        # Save human-readable text summary
+        txt_path = results_path / "evaluation_summary.txt"
+        with open(txt_path, "w") as f:
+            f.write("Teacher Model Evaluation Results\n")
+            f.write("=" * 50 + "\n\n")
+            f.write(f"Overall Test Accuracy: {test_acc:.4f}\n")
+            f.write(f"Total Samples: {total}\n")
+            f.write(f"Correct Predictions: {correct}\n\n")
+            f.write("Per-Class Accuracy:\n")
+            f.write("-" * 50 + "\n")
+            for name, acc in zip(class_names, per_class_acc):
+                f.write(f"  {name}: {acc:.4f}\n")
+        
+        print(f"Evaluation results saved to {results_path}")
+    
+    return result
