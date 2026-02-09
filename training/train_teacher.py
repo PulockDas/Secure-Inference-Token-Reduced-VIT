@@ -119,7 +119,13 @@ def train_teacher(
 
 
 def load_teacher_checkpoint(checkpoint_path: str, device: torch.device) -> nn.Module:
-    """Load teacher model from saved checkpoint."""
+    """
+    Load teacher model from saved checkpoint.
+    checkpoint_path can be local or e.g. a file on mounted Google Drive in Colab:
+      from google.colab import drive
+      drive.mount("/content/drive")
+      teacher = load_teacher_checkpoint("/content/drive/MyDrive/teacher_best.pt", device)
+    """
     ckpt = torch.load(checkpoint_path, map_location=device)
     num_classes = ckpt["num_classes"]
     model = get_teacher_vit(num_classes=num_classes, pretrained=False)
