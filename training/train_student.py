@@ -39,7 +39,7 @@ def train_student(
     val_loader: DataLoader,
     device: torch.device,
     epochs: int = 30,
-    lr: float = 1e-4,
+    lr: float = 5e-5,
     temperature: float = 4.0,
     alpha: float = 0.7,
     use_hard_labels: bool = True,
@@ -86,6 +86,7 @@ def train_student(
         train_hard = 0.0
         train_correct = 0
         train_total = 0
+        train_batches = 0
 
         for images, labels in train_loader:
             images, labels = images.to(device), labels.to(device)
@@ -101,6 +102,10 @@ def train_student(
                 hard_loss = torch.tensor(0.0, device=device)
                 loss = soft_loss
 
+            # Skip step if loss is invalid (avoids corrupting weights with NaN/Inf)
+            if not torch.isfinite(loss):
+                continue
+
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
@@ -112,12 +117,13 @@ def train_student(
             preds = student_logits.argmax(dim=1)
             train_correct += (preds == labels).sum().item()
             train_total += labels.size(0)
+            train_batches += 1
 
-        n = len(train_loader)
+        n = max(1, train_batches)
         train_loss /= n
         train_soft /= n
         train_hard /= n if use_hard_labels else 1.0
-        train_acc = train_correct / train_total
+        train_acc = train_correct / max(1, train_total)
 
         # Validation
         student.eval()
