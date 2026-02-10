@@ -1,13 +1,19 @@
 """
 Learnable token reduction module for student ViT.
 Input (B, N, D) -> output (B, K, D). Preserves CLS token.
-Uses K-1 learnable queries that cross-attend to patch tokens; fully differentiable.
+Uses K-1 learnable queries that cross-attend to patch tokens.
+HE-friendly: no softmax; uses cubic squashing + constant scaling (only + and *).
 """
 
 import math
 
 import torch
 import torch.nn as nn
+
+
+def _cubic_squash_unit(x: torch.Tensor) -> torch.Tensor:
+    """Cubic squash into [-1, 1]: 1.5*x - 0.5*x^3. HE-friendly (only + and *)."""
+    return 1.5 * x - 0.5 * (x * x * x)
 
 
 class TokenReduction(nn.Module):
@@ -32,6 +38,8 @@ class TokenReduction(nn.Module):
         num_queries = max(0, num_output_tokens - 1)
         self.queries = nn.Parameter(torch.randn(1, num_queries, dim) * 0.02)
         self.scale = dim ** -0.5
+        # Bound for squashing logits into ~[-1,1] before cubic (HE-friendly path)
+        self.logit_bound = 6.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -55,10 +63,12 @@ class TokenReduction(nn.Module):
         cls = x[:, :1, :]  # (B, 1, D)
         patches = x[:, 1:, :]  # (B, N-1, D)
 
-        # Cross-attention: K-1 queries attend to patches
+        # Cross-attention: K-1 queries attend to patches (HE-friendly: no softmax)
         q = self.queries.expand(B, -1, -1)  # (B, K-1, D)
-        attn = torch.matmul(q, patches.transpose(-2, -1)) * self.scale  # (B, K-1, N-1)
-        attn = attn.softmax(dim=-1)
-        out = torch.matmul(attn, patches)  # (B, K-1, D)
+        scores = torch.matmul(q, patches.transpose(-2, -1)) * self.scale  # (B, K-1, N-1)
+        # Cubic squash so scores stay in [-1,1]; then scale by 1/(N-1) so output is bounded (only + and *).
+        inv_bound = 1.0 / self.logit_bound
+        scores = _cubic_squash_unit(scores * inv_bound) * (1.0 / (patches.size(1)))
+        out = torch.matmul(scores, patches)  # (B, K-1, D)
 
         return torch.cat([cls, out], dim=1)  # (B, K, D)

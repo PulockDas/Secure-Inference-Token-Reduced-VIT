@@ -107,9 +107,8 @@ class HEAttention(nn.Module):
 
         scores = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / (self.head_dim * N))
 
-        # V clamped to [-bound, bound] (simpler than cubic squash; keeps attention output bounded).
-        # For HE inference, clamp can be replaced by a polynomial approximation if needed.
-        v = v.clamp(-self.bound, self.bound)
+        # V squashed with same cubic as Q/K (HE-friendly; no clamp so no approximation needed at inference).
+        v = _cubic_squash_unit(v * inv_bound) * self.bound
         out = torch.matmul(scores, v)
 
         out = out.transpose(1, 2).contiguous().view(B, N, D)

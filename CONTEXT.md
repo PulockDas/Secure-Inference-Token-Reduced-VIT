@@ -36,9 +36,9 @@ Secure ViT inference under **CKKS homomorphic encryption (TenSEAL)**: train a pl
 
 - **Data**: `data/dataset.py` – `get_lc25000_root`, `get_dataloaders`, 5 classes (lung + colon), 224×224.
 - **Teacher**: `models/teacher.py` – `get_teacher_vit(num_classes)`. Train: `training/train_teacher.py`; eval: `load_teacher_checkpoint`, `evaluate_teacher`; results under `results/teacher/`.
-- **Token reduction**: `models/token_reduction.py` – `TokenReduction(dim, num_output_tokens)`; (B,N,D)→(B,K,D).
-- **HE attention**: `models/he_attention.py` – `HEAttention`. Cubic squashing on Q/K only; V clamped to [-bound,bound]; `output_squash=False` by default for KD stability. Bounded, no softmax/division.
-- **Activations**: `models/activations.py` – `PolynomialGELU` (fitted on [-4,4], input clipped), `CubicSquash` (1.5u−0.5u³).
+- **Token reduction**: `models/token_reduction.py` – `TokenReduction(dim, num_output_tokens)`; (B,N,D)→(B,K,D). HE-friendly: no softmax; cubic squashing + constant scaling on scores.
+- **HE attention**: `models/he_attention.py` – `HEAttention`. Cubic squashing on Q/K/V (no clamp); `output_squash=False` by default. Bounded, no softmax/division.
+- **Activations**: `models/activations.py` – `PolynomialGELU` (input cubic-squashed into [-clip_val,clip_val] then poly; no clamp), `CubicSquash` (1.5u−0.5u³).
 - **Norm**: `models/norm.py` – `create_norm("none"|"affine"|"layernorm", dim)`.
 - **Student**: `models/student.py` – `StudentViT`, `get_student_vit`. Patch embed → CLS+patches → token reduction → blocks (pre-norm, HE attention, MLP: Linear→PolynomialGELU→Linear) → head. Norm mode and residual scale configurable.
 - **Distillation**: `training/train_student.py` – `train_student`, `distillation_loss`, `load_student_checkpoint`. Temperature-scaled KD (T²), optional CE; grad clip 1.0; CSV includes `student_logits_std`, `teacher_logits_std`, `teacher_std_over_T` (verify student_std ≈ teacher_std/T). No logit clipping.
@@ -49,6 +49,12 @@ Secure ViT inference under **CKKS homomorphic encryption (TenSEAL)**: train a pl
 ## Dataset
 
 - **LC25000**: lung + colon histopathology, 5 classes. Resize to 224×224 for ViT.
+
+---
+
+## HE Inference
+
+Student is **HE-ready**: no softmax, no clamp, no division (only + and × and constants). Token reduction, HE attention, and PolynomialGELU all use cubic squashing where bounds are needed. No approximations required for CKKS.
 
 ---
 

@@ -62,10 +62,15 @@ def default_gelu_poly_coefficients(device: Optional[torch.device] = None) -> tor
     return fit_gelu_polynomial(degree=5, low=-4.0, high=4.0, device=device)
 
 
+def _cubic_squash_unit(x: torch.Tensor) -> torch.Tensor:
+    """Cubic squash into [-1, 1]: 1.5*x - 0.5*x^3. HE-friendly (only + and *)."""
+    return 1.5 * x - 0.5 * (x * x * x)
+
+
 class PolynomialGELU(nn.Module):
     """
     GELU approximation using a polynomial (HE-friendly: only + and *).
-    Input is clamped to [-clip_val, clip_val] so the polynomial does not explode for large |x|.
+    Input is squashed into [-clip_val, clip_val] via cubic (no clamp) so HE inference needs no approximation.
     """
 
     def __init__(
@@ -78,7 +83,7 @@ class PolynomialGELU(nn.Module):
         Args:
             degree: Polynomial degree when coefficients is None.
             coefficients: If set, use these (length degree+1); else use default_gelu_poly_coefficients().
-            clip_val: Clamp input to [-clip_val, clip_val] for stability (avoids explosion/NaN).
+            clip_val: Bound for cubic squash; input is mapped to [-clip_val, clip_val] (HE-friendly).
         """
         super().__init__()
         if coefficients is not None:
@@ -91,7 +96,9 @@ class PolynomialGELU(nn.Module):
         self.clip_val = clip_val
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.clamp(x, -self.clip_val, self.clip_val)
+        # Cubic squash into [-clip_val, clip_val] (no clamp; HE-friendly)
+        inv = 1.0 / self.clip_val
+        x = _cubic_squash_unit(x * inv) * self.clip_val
         # Horner-style: c0 + x*(c1 + x*(c2 + ...))
         c = self.coefficients.to(x.dtype)
         out = c[-1].expand_as(x) if x.dim() > 0 else c[-1]
