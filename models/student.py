@@ -11,7 +11,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-from .activations import PolynomialGELU
+from .activations import PolynomialGELU, RunningNorm
 from .he_attention import HEAttention
 from .norm import create_norm
 from .token_reduction import TokenReduction
@@ -55,9 +55,19 @@ class StudentBlock(nn.Module):
         mlp_hidden = int(embed_dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, mlp_hidden),
+            RunningNorm(mlp_hidden),
             PolynomialGELU(),
             nn.Linear(mlp_hidden, embed_dim),
         )
+        # Small init on residual outputs so activations stay bounded
+        self._init_residual_scale()
+
+    def _init_residual_scale(self) -> None:
+        with torch.no_grad():
+            self.attn.out_proj.weight.mul_(0.1)
+            self.attn.out_proj.bias.zero_()
+            self.mlp[3].weight.mul_(0.1)
+            self.mlp[3].bias.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # HEAttention with residual=False; we add residual here so pre-norm is correct

@@ -1,6 +1,7 @@
 """
 HE-friendly activation approximations: only addition and multiplication.
 Polynomial GELU approximates GELU(x) = 0.5*x*(1+erf(x/sqrt(2))) with a polynomial.
+RunningNorm: normalize by running mean and inv_std (only + and * in forward at inference).
 """
 
 import math
@@ -8,6 +9,35 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+
+
+class RunningNorm(nn.Module):
+    """
+    Normalize using running mean and inv_std: out = (x - mean) * inv_std.
+    Both positive and negative values allowed (zero mean, unit variance scale).
+    Forward uses only subtraction and multiplication (HE-friendly at inference).
+    Running stats updated only in training; at inference we use fixed buffers.
+    """
+
+    def __init__(self, dim: int, momentum: float = 0.1, eps: float = 1e-5):
+        super().__init__()
+        self.dim = dim
+        self.momentum = momentum
+        self.eps = eps
+        self.register_buffer("running_mean", torch.zeros(dim))
+        self.register_buffer("running_inv_std", torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (..., dim). Stats over all dims except last.
+        if self.training and x.requires_grad:
+            with torch.no_grad():
+                flat = x.reshape(-1, self.dim)
+                batch_mean = flat.mean(dim=0)
+                batch_std = flat.std(dim=0) + self.eps
+                batch_inv_std = 1.0 / batch_std
+                self.running_mean.mul_(self.momentum).add_(batch_mean, alpha=1 - self.momentum)
+                self.running_inv_std.mul_(self.momentum).add_(batch_inv_std, alpha=1 - self.momentum)
+        return (x - self.running_mean) * self.running_inv_std
 
 
 def fit_gelu_polynomial(
@@ -41,9 +71,8 @@ def default_gelu_poly_coefficients(degree: int = 5) -> torch.Tensor:
 
 class PolynomialGELU(nn.Module):
     """
-    Polynomial approximation of GELU for HE-friendly inference (only + and *).
-    Forward: out = sum_i coeffs[i] * x^i.
-    Default coefficients approximate GELU on [-4, 4]; usable elsewhere with some error.
+    Polynomial approximation of GELU (only + and *). Coefficients fitted on [-4, 4].
+    Use RunningNorm before this in the graph so input is normalized from real stats (no hardcoding).
     """
 
     def __init__(
@@ -51,11 +80,6 @@ class PolynomialGELU(nn.Module):
         degree: int = 5,
         coefficients: Optional[torch.Tensor] = None,
     ):
-        """
-        Args:
-            degree: Polynomial degree (only used if coefficients is None).
-            coefficients: 1D tensor [c0, c1, ..., c_degree]. If None, use default GELU approx.
-        """
         super().__init__()
         if coefficients is not None:
             c = coefficients.view(-1).clone().detach()
@@ -64,7 +88,6 @@ class PolynomialGELU(nn.Module):
         self.register_buffer("_coeffs", c)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """out = c0 + c1*x + c2*x^2 + ... (only + and *)."""
         c = self._coeffs
         out = torch.zeros_like(x)
         for i in range(c.numel()):

@@ -72,8 +72,8 @@ class HEAttention(nn.Module):
         v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
         # Scores: (B, num_heads, N, head_dim) @ (B, num_heads, head_dim, N) -> (B, num_heads, N, N)
-        # No softmax — HE-friendly linear attention
-        scores = torch.matmul(q, k.transpose(-2, -1))
+        # No softmax — HE-friendly linear attention. Scale by 1/N to keep magnitude bounded (train stability).
+        scores = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / N)
         # Output: (B, num_heads, N, N) @ (B, num_heads, N, head_dim) -> (B, num_heads, N, head_dim)
         out = torch.matmul(scores, v)
 
