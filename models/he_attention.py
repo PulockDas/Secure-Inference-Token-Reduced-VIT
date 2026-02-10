@@ -45,7 +45,7 @@ class HEAttention(nn.Module):
         num_heads: int = 1,
         bias: bool = True,
         bound: float = 6.0,
-        output_squash: bool = True,
+        output_squash: bool = False,
     ):
         """
         Args:
@@ -54,6 +54,7 @@ class HEAttention(nn.Module):
             bias: Use bias in Q,K,V and out projections (addition is HE-friendly).
             bound: Single range bound: design target and overflow clamp both [-bound, bound].
             output_squash: If True, squash the post-projection output back to [-bound, bound].
+                Default False for KD stability (avoids squashing the residual path and helps gradients flow).
         """
         super().__init__()
         self.embed_dim = embed_dim
@@ -99,23 +100,22 @@ class HEAttention(nn.Module):
 
         inv_bound = 1.0 / float(self.bound)
 
-        # Squash into [-1, 1] (approximately, assuming inputs are in-range)
+        # Cubic squashing only for Q/K: keeps attention scores bounded without softmax/division (HE-friendly).
+        # Bounded Q,K => dot(Q,K) in [-head_dim, head_dim]; scale by 1/(head_dim*N) => weights ~ 1/N.
         q = _cubic_squash_unit(q * inv_bound)
         k = _cubic_squash_unit(k * inv_bound)
 
-        # Scores bounded by design:
-        #   dot(q,k) <= head_dim (since q,k in [-1,1])
-        #   scale by 1/(head_dim*N) -> |score_ij| <= 1/N
         scores = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / (self.head_dim * N))
 
-        # V in [-bound, bound]
-        v = _cubic_squash_unit(v * inv_bound) * self.bound
-
+        # V clamped to [-bound, bound] (simpler than cubic squash; keeps attention output bounded).
+        # For HE inference, clamp can be replaced by a polynomial approximation if needed.
+        v = v.clamp(-self.bound, self.bound)
         out = torch.matmul(scores, v)
 
         out = out.transpose(1, 2).contiguous().view(B, N, D)
         out = self.out_proj(out)
 
+        # output_squash=False by default for KD stability (no extra squashing on residual path).
         if self.output_squash:
             out = _cubic_squash_unit(out * inv_bound) * self.bound
 

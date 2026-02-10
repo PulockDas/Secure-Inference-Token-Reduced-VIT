@@ -8,7 +8,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-from .activations import CubicSquash, PolynomialGELU
+from .activations import PolynomialGELU
 from .he_attention import HEAttention
 from .norm import create_norm
 from .token_reduction import TokenReduction
@@ -56,16 +56,15 @@ class StudentBlock(nn.Module):
     ):
         super().__init__()
         self.norm1 = create_norm(norm_mode, embed_dim)
-        # Attention is bounded by design via polynomial squashing (HE-friendly path).
-        self.attn = HEAttention(embed_dim, num_heads=num_heads, bound=6.0, output_squash=True)
+        # HE-friendly attention: cubic squashing on Q/K only; output_squash=False for KD stability.
+        self.attn = HEAttention(embed_dim, num_heads=num_heads, bound=6.0, output_squash=False)
         mlp_hidden = int(embed_dim * mlp_ratio)
         self.norm2 = create_norm(norm_mode, embed_dim)
+        # MLP: Linear -> PolynomialGELU -> Linear (no extra cubic squashing; helps KD stability).
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, mlp_hidden),
-            # Apply the same HE-friendly squashing idea in the MLP to keep activations bounded.
-            CubicSquash(bound=6.0),
+            PolynomialGELU(),
             nn.Linear(mlp_hidden, embed_dim),
-            CubicSquash(bound=6.0),
         )
         # Scale residual branches so activations don't drift upward with depth.
         # Constant multiplication is HE-friendly.

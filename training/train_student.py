@@ -23,13 +23,14 @@ def distillation_loss(
     temperature: float = 4.0,
 ) -> torch.Tensor:
     """
-    KL(softmax(student/T) || softmax(teacher/T)) scaled by T^2 so gradient magnitude
-    is roughly independent of temperature.
+    Temperature-scaled KD: KL(softmax(z_s/T), softmax(z_t/T)) * (T*T).
+    Default T=4.0 (configurable). Do not squash or clip logits before KD so gradients
+    flow correctly and the student can match the teacher distribution.
     """
     s_soft = F.log_softmax(student_logits / temperature, dim=1)
     t_soft = F.softmax(teacher_logits / temperature, dim=1)
     kl = F.kl_div(s_soft, t_soft, reduction="batchmean")
-    return kl * (temperature ** 2)
+    return kl * (temperature * temperature)
 
 
 def train_student(
@@ -70,11 +71,12 @@ def train_student(
     if log_path:
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # CSV columns: all metrics needed for plotting
+    # CSV columns: all metrics needed for plotting + logits std for KD verification
     fieldnames = [
         "epoch", "wall_time_s",
         "train_loss", "train_soft_loss", "train_hard_loss", "train_acc",
         "val_loss", "val_soft_loss", "val_hard_loss", "val_acc",
+        "student_logits_std", "teacher_logits_std", "teacher_std_over_T",
     ]
     rows: list = []
 
@@ -87,6 +89,10 @@ def train_student(
         train_correct = 0
         train_total = 0
         train_batches = 0
+        # Accumulate for logits std (verify student_std ≈ teacher_std / T)
+        sum_s, sum_sq_s = 0.0, 0.0
+        sum_t, sum_sq_t = 0.0, 0.0
+        logits_count = 0
 
         for images, labels in train_loader:
             images, labels = images.to(device), labels.to(device)
@@ -108,6 +114,7 @@ def train_student(
 
             optimizer.zero_grad()
             loss.backward()
+            # KD stability: clip gradients so updates don't explode and corrupt the student.
             torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
             optimizer.step()
 
@@ -118,6 +125,14 @@ def train_student(
             train_correct += (preds == labels).sum().item()
             train_total += labels.size(0)
             train_batches += 1
+            # Accumulate for logits std (no grad needed)
+            with torch.no_grad():
+                n_el = student_logits.numel()
+                sum_s += student_logits.sum().item()
+                sum_sq_s += (student_logits ** 2).sum().item()
+                sum_t += teacher_logits.sum().item()
+                sum_sq_t += (teacher_logits ** 2).sum().item()
+                logits_count += n_el
 
         n = max(1, train_batches)
         train_loss /= n
@@ -155,6 +170,18 @@ def train_student(
         val_hard /= nv
         val_acc = val_correct / val_total
 
+        # Logits std: verify student_std ≈ teacher_std / T (temperature-scaled KD)
+        if logits_count > 0:
+            mean_s = sum_s / logits_count
+            mean_t = sum_t / logits_count
+            var_s = (sum_sq_s / logits_count) - (mean_s * mean_s)
+            var_t = (sum_sq_t / logits_count) - (mean_t * mean_t)
+            std_s = (var_s ** 0.5) if var_s > 0 else 0.0
+            std_t = (var_t ** 0.5) if var_t > 0 else 0.0
+            teacher_std_over_T = std_t / temperature if temperature != 0 else 0.0
+        else:
+            std_s = std_t = teacher_std_over_T = 0.0
+
         wall_time = time.perf_counter() - t0
         row = {
             "epoch": epoch + 1,
@@ -167,12 +194,19 @@ def train_student(
             "val_soft_loss": round(val_soft, 6),
             "val_hard_loss": round(val_hard, 6),
             "val_acc": round(val_acc, 4),
+            "student_logits_std": round(std_s, 4),
+            "teacher_logits_std": round(std_t, 4),
+            "teacher_std_over_T": round(teacher_std_over_T, 4),
         }
         rows.append(row)
         print(
             f"Epoch {epoch+1}/{epochs} time={wall_time:.1f}s "
             f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
             f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+        )
+        print(
+            f"  logits_std: student={std_s:.4f} teacher={std_t:.4f}  "
+            f"(verify student_std ≈ teacher_std/T={teacher_std_over_T:.4f})"
         )
 
         if val_acc > best_val_acc and checkpoint_dir:
