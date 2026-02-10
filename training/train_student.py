@@ -40,9 +40,9 @@ def train_student(
     val_loader: DataLoader,
     device: torch.device,
     epochs: int = 30,
-    lr: float = 5e-5,
+    lr: float = 1e-4,
     temperature: float = 4.0,
-    alpha: float = 0.7,
+    alpha: float = 0.2,
     use_hard_labels: bool = True,
     log_path: Optional[str] = None,
     checkpoint_dir: Optional[str] = None,
@@ -82,6 +82,8 @@ def train_student(
 
     for epoch in range(epochs):
         t0 = time.perf_counter()
+        # KD schedule: epochs 1–5 use alpha=0.1, epochs ≥6 use alpha=0.2
+        epoch_alpha = 0.1 if (epoch + 1) <= 5 else 0.2
         student.train()
         train_loss = 0.0
         train_soft = 0.0
@@ -103,7 +105,7 @@ def train_student(
             soft_loss = distillation_loss(student_logits, teacher_logits, temperature)
             if use_hard_labels:
                 hard_loss = ce(student_logits, labels)
-                loss = alpha * soft_loss + (1.0 - alpha) * hard_loss
+                loss = epoch_alpha * soft_loss + (1.0 - epoch_alpha) * hard_loss
             else:
                 hard_loss = torch.tensor(0.0, device=device)
                 loss = soft_loss
@@ -155,7 +157,7 @@ def train_student(
                 soft_loss = distillation_loss(student_logits, teacher_logits, temperature)
                 hard_loss = ce(student_logits, labels)
                 if use_hard_labels:
-                    loss = alpha * soft_loss + (1.0 - alpha) * hard_loss
+                    loss = epoch_alpha * soft_loss + (1.0 - epoch_alpha) * hard_loss
                 else:
                     loss = soft_loss
                 val_loss += loss.item()
