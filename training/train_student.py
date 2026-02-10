@@ -1,0 +1,224 @@
+"""
+Knowledge distillation: train student with KL (temperature) + optional hard-label loss.
+Logging and checkpoints are saved so training curves can be used for plots.
+"""
+
+import csv
+import json
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from models import get_student_vit
+
+
+def distillation_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    temperature: float = 4.0,
+) -> torch.Tensor:
+    """
+    KL(softmax(student/T) || softmax(teacher/T)) scaled by T^2 so gradient magnitude
+    is roughly independent of temperature.
+    """
+    s_soft = F.log_softmax(student_logits / temperature, dim=1)
+    t_soft = F.softmax(teacher_logits / temperature, dim=1)
+    kl = F.kl_div(s_soft, t_soft, reduction="batchmean")
+    return kl * (temperature ** 2)
+
+
+def train_student(
+    student: nn.Module,
+    teacher: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    epochs: int = 30,
+    lr: float = 1e-4,
+    temperature: float = 4.0,
+    alpha: float = 0.7,
+    use_hard_labels: bool = True,
+    log_path: Optional[str] = None,
+    checkpoint_dir: Optional[str] = None,
+    run_config: Optional[Dict[str, Any]] = None,
+) -> nn.Module:
+    """
+    Train student via knowledge distillation. Teacher is frozen.
+    Loss = alpha * soft_loss (KL with temperature) + (1 - alpha) * hard_loss (CE) when use_hard_labels.
+
+    Saves per-epoch metrics to CSV (for plots) and best student checkpoint.
+    run_config is saved as JSON alongside logs for reproducibility.
+    """
+    student = student.to(device)
+    teacher = teacher.to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+
+    optimizer = torch.optim.AdamW(student.parameters(), lr=lr)
+    num_classes = train_loader.dataset.num_classes
+    ce = nn.CrossEntropyLoss()
+
+    best_val_acc = 0.0
+    if checkpoint_dir:
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    if log_path:
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # CSV columns: all metrics needed for plotting
+    fieldnames = [
+        "epoch", "wall_time_s",
+        "train_loss", "train_soft_loss", "train_hard_loss", "train_acc",
+        "val_loss", "val_soft_loss", "val_hard_loss", "val_acc",
+    ]
+    rows: list = []
+
+    for epoch in range(epochs):
+        t0 = time.perf_counter()
+        student.train()
+        train_loss = 0.0
+        train_soft = 0.0
+        train_hard = 0.0
+        train_correct = 0
+        train_total = 0
+
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            with torch.no_grad():
+                teacher_logits = teacher(images)
+            student_logits = student(images)
+
+            soft_loss = distillation_loss(student_logits, teacher_logits, temperature)
+            if use_hard_labels:
+                hard_loss = ce(student_logits, labels)
+                loss = alpha * soft_loss + (1.0 - alpha) * hard_loss
+            else:
+                hard_loss = torch.tensor(0.0, device=device)
+                loss = soft_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+            train_soft += soft_loss.item()
+            train_hard += hard_loss.item() if use_hard_labels else 0.0
+            preds = student_logits.argmax(dim=1)
+            train_correct += (preds == labels).sum().item()
+            train_total += labels.size(0)
+
+        n = len(train_loader)
+        train_loss /= n
+        train_soft /= n
+        train_hard /= n if use_hard_labels else 1.0
+        train_acc = train_correct / train_total
+
+        # Validation
+        student.eval()
+        val_loss = 0.0
+        val_soft = 0.0
+        val_hard = 0.0
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                teacher_logits = teacher(images)
+                student_logits = student(images)
+                soft_loss = distillation_loss(student_logits, teacher_logits, temperature)
+                hard_loss = ce(student_logits, labels)
+                if use_hard_labels:
+                    loss = alpha * soft_loss + (1.0 - alpha) * hard_loss
+                else:
+                    loss = soft_loss
+                val_loss += loss.item()
+                val_soft += soft_loss.item()
+                val_hard += hard_loss.item()
+                preds = student_logits.argmax(dim=1)
+                val_correct += (preds == labels).sum().item()
+                val_total += labels.size(0)
+        nv = len(val_loader)
+        val_loss /= nv
+        val_soft /= nv
+        val_hard /= nv
+        val_acc = val_correct / val_total
+
+        wall_time = time.perf_counter() - t0
+        row = {
+            "epoch": epoch + 1,
+            "wall_time_s": round(wall_time, 2),
+            "train_loss": round(train_loss, 6),
+            "train_soft_loss": round(train_soft, 6),
+            "train_hard_loss": round(train_hard, 6),
+            "train_acc": round(train_acc, 4),
+            "val_loss": round(val_loss, 6),
+            "val_soft_loss": round(val_soft, 6),
+            "val_hard_loss": round(val_hard, 6),
+            "val_acc": round(val_acc, 4),
+        }
+        rows.append(row)
+        print(
+            f"Epoch {epoch+1}/{epochs} time={wall_time:.1f}s "
+            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+        )
+
+        if val_acc > best_val_acc and checkpoint_dir:
+            best_val_acc = val_acc
+            ckpt_path = Path(checkpoint_dir) / "student_best.pt"
+            torch.save(
+                {
+                    "student_state_dict": student.state_dict(),
+                    "epoch": epoch + 1,
+                    "val_acc": val_acc,
+                    "num_classes": num_classes,
+                },
+                ckpt_path,
+            )
+            print(f"  -> saved best ({val_acc:.4f})")
+
+    if log_path:
+        with open(log_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(rows)
+
+    if run_config is not None and (log_path or checkpoint_dir):
+        base = Path(log_path).parent if log_path else Path(checkpoint_dir)
+        base.mkdir(parents=True, exist_ok=True)
+        k = run_config.get("num_output_tokens")
+        name = f"distill_run_config_K{k}.json" if k is not None else "distill_run_config.json"
+        config_path = base / name
+        with open(config_path, "w") as f:
+            json.dump(run_config, f, indent=2)
+
+    return student
+
+
+def load_student_checkpoint(
+    checkpoint_path: str,
+    device: torch.device,
+    num_output_tokens: int = 97,
+    embed_dim: int = 384,
+    depth: int = 6,
+    num_heads: int = 6,
+    norm_mode: str = "affine",
+) -> nn.Module:
+    """Load student from saved checkpoint (state_dict only; no teacher/bridge)."""
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    num_classes = ckpt["num_classes"]
+    student = get_student_vit(
+        num_classes=num_classes,
+        embed_dim=embed_dim,
+        depth=depth,
+        num_heads=num_heads,
+        num_output_tokens=num_output_tokens,
+        norm_mode=norm_mode,
+    )
+    student.load_state_dict(ckpt["student_state_dict"])
+    return student.to(device)

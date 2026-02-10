@@ -139,10 +139,12 @@ def evaluate_teacher(
     device: torch.device,
     class_names: list,
     results_dir: Optional[str] = None,
+    results_subdir: str = "teacher",
 ) -> Dict:
     """
-    Evaluate teacher on test set. Returns dict with test_acc and per_class_acc.
-    Optionally saves results to results_dir/teacher/ directory.
+    Evaluate model on test set. Returns dict with test_acc and per_class_acc.
+    Optionally saves results to results_dir/results_subdir/ (default teacher).
+    Use results_subdir="student" or "student_K97" when evaluating student.
     """
     model.eval()
     correct = 0
@@ -170,7 +172,7 @@ def evaluate_teacher(
     
     # Save results to file if results_dir is provided
     if results_dir:
-        results_path = Path(results_dir) / "teacher"
+        results_path = Path(results_dir) / results_subdir
         results_path.mkdir(parents=True, exist_ok=True)
         
         # Save JSON file with all results
