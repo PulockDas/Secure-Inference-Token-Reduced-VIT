@@ -82,8 +82,6 @@ def train_student(
 
     for epoch in range(epochs):
         t0 = time.perf_counter()
-        # KD schedule: epochs 1–5 use alpha=0.1, epochs ≥6 use alpha=0.2
-        epoch_alpha = 0.1 if (epoch + 1) <= 5 else 0.2
         student.train()
         train_loss = 0.0
         train_soft = 0.0
@@ -105,7 +103,7 @@ def train_student(
             soft_loss = distillation_loss(student_logits, teacher_logits, temperature)
             if use_hard_labels:
                 hard_loss = ce(student_logits, labels)
-                loss = epoch_alpha * soft_loss + (1.0 - epoch_alpha) * hard_loss
+                loss = alpha * soft_loss + (1.0 - alpha) * hard_loss
             else:
                 hard_loss = torch.tensor(0.0, device=device)
                 loss = soft_loss
@@ -157,7 +155,7 @@ def train_student(
                 soft_loss = distillation_loss(student_logits, teacher_logits, temperature)
                 hard_loss = ce(student_logits, labels)
                 if use_hard_labels:
-                    loss = epoch_alpha * soft_loss + (1.0 - epoch_alpha) * hard_loss
+                    loss = alpha * soft_loss + (1.0 - alpha) * hard_loss
                 else:
                     loss = soft_loss
                 val_loss += loss.item()
