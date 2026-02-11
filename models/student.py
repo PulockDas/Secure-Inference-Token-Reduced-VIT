@@ -114,7 +114,8 @@ class StudentViT(nn.Module):
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat([cls_tokens, x], dim=1)
         x = x + self.pos_embed
-        x = self.token_reduction(x)
+        # TEMP: bypass token reduction for debugging (student uses full 1+num_patches tokens)
+        # x = self.token_reduction(x)
         for block in self.blocks:
             x = block(x)
         x = self.norm(x)
