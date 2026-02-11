@@ -52,7 +52,7 @@ class StudentBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         norm_mode: Literal["none", "affine", "layernorm"] = "affine",
-        residual_scale: float = 0.25,
+        residual_scale: float = 1,
     ):
         super().__init__()
         self.norm1 = create_norm(norm_mode, embed_dim)
