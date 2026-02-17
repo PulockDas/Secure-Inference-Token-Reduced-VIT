@@ -38,8 +38,6 @@ class TokenReduction(nn.Module):
         num_queries = max(0, num_output_tokens - 1)
         self.queries = nn.Parameter(torch.randn(1, num_queries, dim) * 0.02)
         self.scale = dim ** -0.5
-        # Bound for squashing logits into ~[-1,1] before cubic (HE-friendly path)
-        self.logit_bound = 6.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -65,10 +63,9 @@ class TokenReduction(nn.Module):
 
         # Cross-attention: K-1 queries attend to patches (HE-friendly: no softmax)
         q = self.queries.expand(B, -1, -1)  # (B, K-1, D)
-        scores = torch.matmul(q, patches.transpose(-2, -1)) * self.scale  # (B, K-1, N-1)
-        # Cubic squash so scores stay in [-1,1]; then scale by 1/(N-1) so output is bounded (only + and *).
-        inv_bound = 1.0 / self.logit_bound
-        scores = _cubic_squash_unit(scores * inv_bound) * (1.0 / (patches.size(1)))
+        norm = 1 / (patches.size(1))
+        scores = torch.matmul(q, patches.transpose(-2, -1)) * self.scale * norm  # (B, K-1, N-1)
+        
         out = torch.matmul(scores, patches)  # (B, K-1, D)
 
         return torch.cat([cls, out], dim=1)  # (B, K, D)

@@ -51,7 +51,7 @@ class StudentBlock(nn.Module):
         embed_dim: int,
         num_heads: int,
         mlp_ratio: float = 4.0,
-        norm_mode: Literal["none", "affine", "layernorm"] = "affine",
+        norm_mode: Literal["none", "affine", "layernorm"] = "layernorm",
         residual_scale: float = 1,
     ):
         super().__init__()
@@ -88,7 +88,7 @@ class StudentViT(nn.Module):
         depth: int = 6,
         num_heads: int = 6,
         num_output_tokens: int = 97,
-        norm_mode: Literal["none", "affine", "layernorm"] = "affine",
+        norm_mode: Literal["none", "affine", "layernorm"] = "layernorm",
         img_size: int = 224,
         patch_size: int = 16,
     ):
@@ -98,7 +98,7 @@ class StudentViT(nn.Module):
         self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + num_patches, embed_dim) * 0.02)
+        self.pos_embed = nn.Parameter(torch.randn(1, 1 + num_patches, embed_dim) * 0.02)
         self.token_reduction = TokenReduction(embed_dim, num_output_tokens)
         self.blocks = nn.ModuleList([
             StudentBlock(embed_dim, num_heads, norm_mode=norm_mode)
@@ -114,8 +114,7 @@ class StudentViT(nn.Module):
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat([cls_tokens, x], dim=1)
         x = x + self.pos_embed
-        # TEMP: bypass token reduction for debugging (student uses full 1+num_patches tokens)
-        # x = self.token_reduction(x)
+        x = self.token_reduction(x)
         for block in self.blocks:
             x = block(x)
         x = self.norm(x)
@@ -129,7 +128,7 @@ def get_student_vit(
     depth: int = 6,
     num_heads: int = 6,
     num_output_tokens: int = 97,
-    norm_mode: Literal["none", "affine", "layernorm"] = "affine",
+    norm_mode: Literal["none", "affine", "layernorm"] = "layernorm",
     img_size: int = 224,
     patch_size: int = 16,
 ) -> StudentViT:

@@ -248,7 +248,7 @@ def load_student_checkpoint(
     embed_dim: int = 384,
     depth: int = 6,
     num_heads: int = 6,
-    norm_mode: str = "affine",
+    norm_mode: str = "layernorm",
 ) -> nn.Module:
     """Load student from saved checkpoint (state_dict only; no teacher/bridge)."""
     ckpt = torch.load(checkpoint_path, map_location=device)
