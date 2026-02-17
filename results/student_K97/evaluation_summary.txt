@@ -1,0 +1,14 @@
+Teacher Model Evaluation Results
+==================================================
+
+Overall Test Accuracy: 0.9211
+Total Samples: 3750
+Correct Predictions: 3454
+
+Per-Class Accuracy:
+--------------------------------------------------
+  colon_aca: 0.9413
+  colon_n: 0.8547
+  lung_aca: 0.8507
+  lung_n: 0.9973
+  lung_scc: 0.9613

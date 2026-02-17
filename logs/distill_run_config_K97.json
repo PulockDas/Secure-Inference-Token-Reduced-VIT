@@ -1,0 +1,11 @@
+{
+  "num_output_tokens": 97,
+  "embed_dim": 384,
+  "depth": 6,
+  "num_heads": 6,
+  "norm_mode": "layernorm",
+  "temperature": 4.0,
+  "alpha": 0.7,
+  "use_hard_labels": true,
+  "lr": 3e-05
+}
