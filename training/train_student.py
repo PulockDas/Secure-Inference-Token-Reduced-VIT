@@ -42,7 +42,7 @@ def train_student(
     epochs: int = 30,
     lr: float = 1e-4,
     temperature: float = 4.0,
-    alpha: float = 0.2,
+    alpha: float = 0.7,
     use_hard_labels: bool = True,
     log_path: Optional[str] = None,
     checkpoint_dir: Optional[str] = None,
