@@ -35,15 +35,22 @@ class PatchEmbed(nn.Module):
         return x
 
 
+class LayerScale(nn.Module):
+    """Per-channel scale on residual branch. Init 0.1 for depth ≤ 18 (DeiT III)."""
+
+    def __init__(self, dim: int, init_values: float = 0.1):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim) * init_values)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gamma
+
+
 class StudentBlock(nn.Module):
     """
     One transformer block: pre-norm -> HEAttention -> residual;
     pre-norm -> MLP (Linear -> PolynomialGELU -> Linear) -> residual.
-
-    Norm roles (no redundant stacking):
-    - Pre-norm (affine/none): standard for residuals; affine = scale+shift only (HE-friendly).
-    - L2 inside HEAttention: only place we need it, to bound attention by design.
-    - No RunningNorm in MLP: keeps block light; PolynomialGELU has its own input clip.
+    LayerScale (init 0.1) on residual branches per modern ViT.
     """
 
     def __init__(
@@ -52,27 +59,24 @@ class StudentBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         norm_mode: Literal["none", "affine", "layernorm"] = "layernorm",
-        residual_scale: float = 1,
+        init_values: float = 0.1,
     ):
         super().__init__()
         self.norm1 = create_norm(norm_mode, embed_dim)
-        # HE-friendly attention: cubic squashing on Q/K only; output_squash=False for KD stability.
         self.attn = HEAttention(embed_dim, num_heads=num_heads, bound=6.0, output_squash=False)
         mlp_hidden = int(embed_dim * mlp_ratio)
         self.norm2 = create_norm(norm_mode, embed_dim)
-        # MLP: Linear -> PolynomialGELU -> Linear (no extra cubic squashing; helps KD stability).
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, mlp_hidden),
             PolynomialGELU(),
             nn.Linear(mlp_hidden, embed_dim),
         )
-        # Scale residual branches so activations don't drift upward with depth.
-        # Constant multiplication is HE-friendly.
-        self.residual_scale = residual_scale
+        self.ls1 = LayerScale(embed_dim, init_values)
+        self.ls2 = LayerScale(embed_dim, init_values)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.residual_scale * self.attn(self.norm1(x), residual=False)
-        x = x + self.residual_scale * self.mlp(self.norm2(x))
+        x = x + self.ls1(self.attn(self.norm1(x), residual=False))
+        x = x + self.ls2(self.mlp(self.norm2(x)))
         return x
 
 
