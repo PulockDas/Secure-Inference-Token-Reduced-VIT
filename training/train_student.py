@@ -42,7 +42,7 @@ def train_student(
     epochs: int = 30,
     lr: float = 1e-4,
     temperature: float = 4.0,
-    alpha: float = 0.2,
+    alpha: float = 0.7,
     use_hard_labels: bool = True,
     log_path: Optional[str] = None,
     checkpoint_dir: Optional[str] = None,
@@ -82,8 +82,6 @@ def train_student(
 
     for epoch in range(epochs):
         t0 = time.perf_counter()
-        # KD schedule: epochs 1–5 use alpha=0.1, epochs ≥6 use alpha=0.2
-        epoch_alpha = 0.1 if (epoch + 1) <= 5 else 0.2
         student.train()
         train_loss = 0.0
         train_soft = 0.0
@@ -105,7 +103,7 @@ def train_student(
             soft_loss = distillation_loss(student_logits, teacher_logits, temperature)
             if use_hard_labels:
                 hard_loss = ce(student_logits, labels)
-                loss = epoch_alpha * soft_loss + (1.0 - epoch_alpha) * hard_loss
+                loss = alpha * soft_loss + (1.0 - alpha) * hard_loss
             else:
                 hard_loss = torch.tensor(0.0, device=device)
                 loss = soft_loss
@@ -157,7 +155,7 @@ def train_student(
                 soft_loss = distillation_loss(student_logits, teacher_logits, temperature)
                 hard_loss = ce(student_logits, labels)
                 if use_hard_labels:
-                    loss = epoch_alpha * soft_loss + (1.0 - epoch_alpha) * hard_loss
+                    loss = alpha * soft_loss + (1.0 - alpha) * hard_loss
                 else:
                     loss = soft_loss
                 val_loss += loss.item()
@@ -214,15 +212,20 @@ def train_student(
         if val_acc > best_val_acc and checkpoint_dir:
             best_val_acc = val_acc
             ckpt_path = Path(checkpoint_dir) / "student_best.pt"
-            torch.save(
-                {
-                    "student_state_dict": student.state_dict(),
-                    "epoch": epoch + 1,
-                    "val_acc": val_acc,
-                    "num_classes": num_classes,
-                },
-                ckpt_path,
-            )
+            state = student.state_dict()
+            ckpt = {
+                "student_state_dict": state,
+                "epoch": epoch + 1,
+                "val_acc": val_acc,
+                "num_classes": num_classes,
+                "norm_mode": "layernorm" if "blocks.0.norm1.weight" in state else "affine",
+            }
+            if run_config is not None:
+                ckpt["num_output_tokens"] = run_config.get("num_output_tokens", 97)
+                ckpt["embed_dim"] = run_config.get("embed_dim", 384)
+                ckpt["depth"] = run_config.get("depth", 6)
+                ckpt["num_heads"] = run_config.get("num_heads", 6)
+            torch.save(ckpt, ckpt_path)
             print(f"  -> saved best ({val_acc:.4f})")
 
     if log_path:
@@ -250,11 +253,16 @@ def load_student_checkpoint(
     embed_dim: int = 384,
     depth: int = 6,
     num_heads: int = 6,
-    norm_mode: str = "affine",
+    norm_mode: Optional[str] = None,
 ) -> nn.Module:
-    """Load student from saved checkpoint (state_dict only; no teacher/bridge)."""
+    """Load student from saved checkpoint. Uses checkpoint's config when available."""
     ckpt = torch.load(checkpoint_path, map_location=device)
     num_classes = ckpt["num_classes"]
+    norm_mode = norm_mode or ckpt.get("norm_mode", "layernorm")
+    num_output_tokens = ckpt.get("num_output_tokens", num_output_tokens)
+    embed_dim = ckpt.get("embed_dim", embed_dim)
+    depth = ckpt.get("depth", depth)
+    num_heads = ckpt.get("num_heads", num_heads)
     student = get_student_vit(
         num_classes=num_classes,
         embed_dim=embed_dim,

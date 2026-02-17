@@ -28,7 +28,7 @@ def test_patch_embed():
 
 def test_student_forward_shape():
     """StudentViT forward: (B, 3, 224, 224) -> (B, num_classes)."""
-    model = get_student_vit(num_classes=5, num_output_tokens=97, norm_mode="affine")
+    model = get_student_vit(num_classes=5, num_output_tokens=97, norm_mode="layernorm")
     x = torch.randn(2, 3, 224, 224)
     logits = model(x)
     assert logits.shape == (2, 5)
@@ -54,9 +54,9 @@ def test_student_k_values():
 
 
 def test_student_norm_modes():
-    """Both norm_mode 'none' and 'affine' run without error."""
+    """Both norm_mode 'none' and 'layernorm' run without error."""
     x = torch.randn(1, 3, 224, 224)
-    for mode in ("none", "affine"):
+    for mode in ("none", "layernorm"):
         model = get_student_vit(num_classes=5, num_output_tokens=97, norm_mode=mode)
         logits = model(x)
         assert logits.shape == (1, 5)
