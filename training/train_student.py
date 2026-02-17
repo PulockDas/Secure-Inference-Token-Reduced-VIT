@@ -212,15 +212,20 @@ def train_student(
         if val_acc > best_val_acc and checkpoint_dir:
             best_val_acc = val_acc
             ckpt_path = Path(checkpoint_dir) / "student_best.pt"
-            torch.save(
-                {
-                    "student_state_dict": student.state_dict(),
-                    "epoch": epoch + 1,
-                    "val_acc": val_acc,
-                    "num_classes": num_classes,
-                },
-                ckpt_path,
-            )
+            state = student.state_dict()
+            ckpt = {
+                "student_state_dict": state,
+                "epoch": epoch + 1,
+                "val_acc": val_acc,
+                "num_classes": num_classes,
+                "norm_mode": "layernorm" if "blocks.0.norm1.weight" in state else "affine",
+            }
+            if run_config is not None:
+                ckpt["num_output_tokens"] = run_config.get("num_output_tokens", 97)
+                ckpt["embed_dim"] = run_config.get("embed_dim", 384)
+                ckpt["depth"] = run_config.get("depth", 6)
+                ckpt["num_heads"] = run_config.get("num_heads", 6)
+            torch.save(ckpt, ckpt_path)
             print(f"  -> saved best ({val_acc:.4f})")
 
     if log_path:
@@ -248,11 +253,16 @@ def load_student_checkpoint(
     embed_dim: int = 384,
     depth: int = 6,
     num_heads: int = 6,
-    norm_mode: str = "layernorm",
+    norm_mode: Optional[str] = None,
 ) -> nn.Module:
-    """Load student from saved checkpoint (state_dict only; no teacher/bridge)."""
+    """Load student from saved checkpoint. Uses checkpoint's config when available."""
     ckpt = torch.load(checkpoint_path, map_location=device)
     num_classes = ckpt["num_classes"]
+    norm_mode = norm_mode or ckpt.get("norm_mode", "layernorm")
+    num_output_tokens = ckpt.get("num_output_tokens", num_output_tokens)
+    embed_dim = ckpt.get("embed_dim", embed_dim)
+    depth = ckpt.get("depth", depth)
+    num_heads = ckpt.get("num_heads", num_heads)
     student = get_student_vit(
         num_classes=num_classes,
         embed_dim=embed_dim,
