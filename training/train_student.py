@@ -274,5 +274,11 @@ def load_student_checkpoint(
         num_output_tokens=num_output_tokens,
         norm_mode=norm_mode,
     )
-    student.load_state_dict(ckpt["student_state_dict"])
+    state = ckpt["student_state_dict"]
+    load_result = student.load_state_dict(state, strict=False)
+    if load_result.missing_keys:
+        # e.g. older checkpoints without LayerScale (ls1/ls2.gamma) — keep default init 0.1
+        print("Load checkpoint: missing keys (using default init):", load_result.missing_keys)
+    if load_result.unexpected_keys:
+        print("Load checkpoint: unexpected keys (ignored):", load_result.unexpected_keys)
     return student.to(device)
