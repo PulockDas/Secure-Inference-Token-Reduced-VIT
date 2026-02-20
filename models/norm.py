@@ -136,7 +136,8 @@ def replace_layernorm_with_static(
     handles = []
 
     def make_hook(idx: int):
-        def hook(module: nn.Module, inp: Tuple[torch.Tensor, ...], out: torch.Tensor) -> None:
+        def hook(module: nn.Module, inp: Tuple[torch.Tensor, ...]) -> None:
+            # Pre-hook: only (module, args); no output yet
             x = inp[0] if isinstance(inp[0], torch.Tensor) else inp[0][0]
             captured[idx].append(x.detach())
         return hook
