@@ -211,20 +211,23 @@ def train_student(
 
         if val_acc > best_val_acc and checkpoint_dir:
             best_val_acc = val_acc
-            ckpt_path = Path(checkpoint_dir) / "student_best.pt"
             state = student.state_dict()
             ckpt = {
                 "student_state_dict": state,
                 "epoch": epoch + 1,
                 "val_acc": val_acc,
                 "num_classes": num_classes,
-                "norm_mode": "layernorm" if "blocks.0.norm1.weight" in state else "affine",
+                "total_epochs": epochs,
+                "norm_mode": run_config.get("norm_mode", "layernorm") if run_config else ("layernorm" if "blocks.0.norm1.weight" in state else "affine"),
             }
             if run_config is not None:
                 ckpt["num_output_tokens"] = run_config.get("num_output_tokens", 97)
                 ckpt["embed_dim"] = run_config.get("embed_dim", 384)
                 ckpt["depth"] = run_config.get("depth", 6)
                 ckpt["num_heads"] = run_config.get("num_heads", 6)
+                ckpt_path = Path(checkpoint_dir) / f"student_best_K{ckpt['num_output_tokens']}_E{epochs}.pt"
+            else:
+                ckpt_path = Path(checkpoint_dir) / "student_best.pt"
             torch.save(ckpt, ckpt_path)
             print(f"  -> saved best ({val_acc:.4f})")
 
