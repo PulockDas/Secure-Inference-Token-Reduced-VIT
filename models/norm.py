@@ -3,8 +3,8 @@ Modular norm for student transformer blocks: no norm, affine-only, or LayerNorm.
 LayerNorm uses mean/variance and division (not HE-friendly). Affine-only is scale + shift (HE-friendly).
 Residual connections stay valid: out = x + sublayer(norm(x)); norm is (B,N,D)->(B,N,D).
 
-Static/Frozen LayerNorm: for HE inference, replace LayerNorm with y = scale * x + bias where
-scale and bias are precomputed from calibration (μ_fixed, σ_fixed^2) and the trained gamma/beta.
+LayerNorm approximation for HE inference: replace LayerNorm with a +/*-only approximation
+(polynomial init + Newton rsqrt) so the encrypted circuit avoids division/sqrt.
 """
 
 from typing import Literal, List, Optional, Tuple
@@ -41,21 +41,74 @@ class _IdentityNorm(nn.Module):
         return x
 
 
-class StaticLayerNorm(nn.Module):
+class ApproxLayerNorm(nn.Module):
     """
-    HE-friendly LayerNorm replacement: y = scale * x + bias.
-    scale and bias are computed once from calibration (μ_fixed, σ_fixed^2) and the
-    trained LayerNorm's gamma/beta, so forward uses only + and * (no division at inference).
+    HE-friendly LayerNorm approximation using only + and * at inference time.
+
+    We compute per-token mean/variance over the feature dimension (addition/multiplication
+    plus a constant multiply for division by D), then approximate inv_sqrt(var + eps)
+    with a small number of Newton-Raphson iterations:
+
+        y_{k+1} = y_k * (1.5 - 0.5 * a * y_k^2),   where a = var + eps
+
+    This avoids division/sqrt in the forward pass while closely matching LayerNorm
+    if the initialization is calibrated well.
     """
 
-    def __init__(self, scale: torch.Tensor, bias: torch.Tensor):
+    def __init__(
+        self,
+        gamma: torch.Tensor,
+        beta: torch.Tensor,
+        inv_sqrt_init: Optional[torch.Tensor] = None,
+        inv_sqrt_poly_coeffs: Optional[torch.Tensor] = None,
+        eps: float = 1e-6,
+        iters: int = 2,
+    ):
         super().__init__()
-        assert scale.shape == bias.shape and scale.dim() == 1
-        self.register_buffer("scale", scale.clone().detach())
-        self.register_buffer("bias", bias.clone().detach())
+        assert gamma.shape == beta.shape and gamma.dim() == 1
+        self.register_buffer("gamma", gamma.clone().detach())
+        self.register_buffer("beta", beta.clone().detach())
+
+        if inv_sqrt_poly_coeffs is None and inv_sqrt_init is None:
+            raise ValueError("Provide either inv_sqrt_init or inv_sqrt_poly_coeffs.")
+
+        if inv_sqrt_poly_coeffs is not None:
+            coeffs = inv_sqrt_poly_coeffs.clone().detach()
+            if coeffs.dim() != 1:
+                raise ValueError("inv_sqrt_poly_coeffs must be 1D.")
+            self.register_buffer("inv_sqrt_poly_coeffs", coeffs)
+        else:
+            self.register_buffer("inv_sqrt_poly_coeffs", torch.empty(0))
+
+        if inv_sqrt_init is not None:
+            inv_sqrt_init = inv_sqrt_init.clone().detach()
+            if inv_sqrt_init.dim() == 0:
+                inv_sqrt_init = inv_sqrt_init.view(1, 1, 1)
+            self.register_buffer("inv_sqrt_init", inv_sqrt_init)
+        else:
+            self.register_buffer("inv_sqrt_init", torch.empty(0))
+
+        self.eps = float(eps)
+        self.iters = int(iters)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.scale + self.bias
+        mean = x.mean(dim=-1, keepdim=True)
+        centered = x - mean
+        var = (centered * centered).mean(dim=-1, keepdim=True)
+        a = var + self.eps
+
+        if self.inv_sqrt_poly_coeffs.numel() > 0:
+            coeffs = self.inv_sqrt_poly_coeffs
+            y = coeffs[-1]
+            for c in reversed(coeffs[:-1]):
+                y = y * a + c
+        else:
+            y = self.inv_sqrt_init
+        for _ in range(self.iters):
+            y = y * (1.5 - 0.5 * a * y * y)
+
+        x_norm = centered * y
+        return x_norm * self.gamma + self.beta
 
 
 def create_norm(
@@ -89,40 +142,23 @@ def create_norm(
     raise ValueError(f"Unknown norm mode: {mode!r}. Use 'none', 'affine', or 'layernorm'.")
 
 
-def _compute_static_ln_scale_bias(
-    gamma: torch.Tensor,
-    beta: torch.Tensor,
-    mu: torch.Tensor,
-    var: torch.Tensor,
-    eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """From LN params and calibration (μ, σ^2): scale = gamma/sqrt(σ^2+eps), bias = beta - μ*scale."""
-    std = (var + eps).sqrt()
-    scale = gamma / std
-    bias = beta - mu * scale
-    return scale, bias
 
 
-def replace_layernorm_with_static(
+def replace_layernorm_with_approx(
     model: nn.Module,
     calibration_loader: DataLoader,
     device: torch.device,
     num_calibration_batches: int = 16,
     eps: float = 1e-6,
+    iters: int = 2,
 ) -> List[str]:
     """
-    Replace all nn.LayerNorm in model with StaticLayerNorm using calibration data.
+    Replace all nn.LayerNorm with ApproxLayerNorm using calibration data.
 
-    Runs calibration batches through the model, captures (input, output) pairs for
-    each LayerNorm, and for every feature dimension solves a 1D least-squares fit
-    y ≈ scale * x + bias over the collected data. The fitted (scale, bias) are
-    then frozen into StaticLayerNorm so that inference uses only + and * while
-    closely mimicking the original LayerNorm on the calibration distribution.
-
-    Returns:
-        List of replaced module names (e.g. ["blocks.0.norm1", "blocks.0.norm2", ...]).
+    Calibration estimates the typical per-token variance (over the feature dim) at the
+    input to each LayerNorm. We use that to choose an initialization for the Newton
+    inv_sqrt iterations. Replacement is then done in-place.
     """
-    # Collect (name, module) for all LayerNorms
     ln_names: List[str] = []
     ln_modules: List[nn.LayerNorm] = []
     for name, module in model.named_modules():
@@ -133,20 +169,51 @@ def replace_layernorm_with_static(
     if not ln_names:
         return []
 
-    # Capture inputs and outputs for each LayerNorm via forward hooks
-    inputs_per_ln: List[List[torch.Tensor]] = [[] for _ in ln_names]
-    outputs_per_ln: List[List[torch.Tensor]] = [[] for _ in ln_names]
+    # Fit a small polynomial y0(a) ≈ 1/sqrt(a) for a = var + eps (per token) to
+    # get a good Newton initialization without non-HE ops at inference.
+    # Degree-2 least squares using accumulated moments:
+    # A = [[Σ1,  Σa,   Σa² ],
+    #      [Σa, Σa²,  Σa³ ],
+    #      [Σa²,Σa³,  Σa⁴ ]],  b = [Σt, Σt·a, Σt·a²],  t = 1/sqrt(a)
+    s0 = [0.0 for _ in ln_names]
+    s1 = [0.0 for _ in ln_names]
+    s2 = [0.0 for _ in ln_names]
+    s3 = [0.0 for _ in ln_names]
+    s4 = [0.0 for _ in ln_names]
+    b0 = [0.0 for _ in ln_names]
+    b1 = [0.0 for _ in ln_names]
+    b2 = [0.0 for _ in ln_names]
     handles = []
 
     def make_hook(idx: int):
-        def hook(module: nn.Module, inp: Tuple[torch.Tensor, ...], out: torch.Tensor) -> None:
+        def hook(module: nn.Module, inp: Tuple[torch.Tensor, ...]) -> None:
             x = inp[0] if isinstance(inp[0], torch.Tensor) else inp[0][0]
-            inputs_per_ln[idx].append(x.detach())
-            outputs_per_ln[idx].append(out.detach())
+            # Per-token variance over feature dim
+            with torch.no_grad():
+                m = x.mean(dim=-1, keepdim=True)
+                c = x - m
+                a = (c * c).mean(dim=-1) + eps  # (B, N)
+                t = a.rsqrt()  # plaintext calibration only
+
+                a1 = a
+                a2 = a1 * a1
+                a3 = a2 * a1
+                a4 = a2 * a2
+
+                s0[idx] += float(a1.numel())
+                s1[idx] += float(a1.sum().detach().cpu().item())
+                s2[idx] += float(a2.sum().detach().cpu().item())
+                s3[idx] += float(a3.sum().detach().cpu().item())
+                s4[idx] += float(a4.sum().detach().cpu().item())
+
+                b0[idx] += float(t.sum().detach().cpu().item())
+                b1[idx] += float((t * a1).sum().detach().cpu().item())
+                b2[idx] += float((t * a2).sum().detach().cpu().item())
+
         return hook
 
-    for idx, (name, module) in enumerate(zip(ln_names, ln_modules)):
-        handles.append(module.register_forward_hook(make_hook(idx)))
+    for idx, module in enumerate(ln_modules):
+        handles.append(module.register_forward_pre_hook(make_hook(idx)))
 
     model.eval()
     batch_count = 0
@@ -161,48 +228,37 @@ def replace_layernorm_with_static(
     for h in handles:
         h.remove()
 
-    # For each LayerNorm: concat captured inputs/outputs and fit per-feature affine map
     replaced: List[str] = []
-    tiny = 1e-8
     for idx, name in enumerate(ln_names):
         ln = ln_modules[idx]
-        xs = inputs_per_ln[idx]
-        ys = outputs_per_ln[idx]
-        if not xs or not ys:
+        if s0[idx] <= 0:
             continue
 
-        all_x = torch.cat(xs, dim=0)  # (B_total, N, D)
-        all_y = torch.cat(ys, dim=0)  # (B_total, N, D)
-        B_total, N, D = all_x.shape
+        A = torch.tensor(
+            [
+                [s0[idx], s1[idx], s2[idx]],
+                [s1[idx], s2[idx], s3[idx]],
+                [s2[idx], s3[idx], s4[idx]],
+            ],
+            dtype=torch.float64,
+        )
+        bb = torch.tensor([b0[idx], b1[idx], b2[idx]], dtype=torch.float64)
+        ridge = (1e-6 * s0[idx]) if s0[idx] > 0 else 1e-6
+        A = A + torch.eye(3, dtype=torch.float64) * ridge
+        coeffs = torch.linalg.solve(A, bb).to(dtype=torch.float32, device=device)
 
-        x_flat = all_x.view(B_total * N, D)
-        y_flat = all_y.view(B_total * N, D)
-
-        # Linear regression y ≈ scale * x + bias (per feature)
-        mu_x = x_flat.mean(dim=0)
-        mu_y = y_flat.mean(dim=0)
-        x_centered = x_flat - mu_x
-        y_centered = y_flat - mu_y
-
-        var_x = (x_centered * x_centered).mean(dim=0)
-        cov_xy = (x_centered * y_centered).mean(dim=0)
-
-        scale = cov_xy / (var_x + eps)
-        # Guard against near-constant inputs
-        mask_bad = var_x < tiny
-        if mask_bad.any():
-            scale = scale.clone()
-            scale[mask_bad] = 1.0
-
-        bias = mu_y - scale * mu_x
-
-        static_ln = StaticLayerNorm(scale, bias)
-        static_ln.to(device=device)
+        approx_ln = ApproxLayerNorm(
+            gamma=ln.weight.detach(),
+            beta=ln.bias.detach(),
+            inv_sqrt_poly_coeffs=coeffs,
+            eps=eps,
+            iters=iters,
+        ).to(device=device)
 
         parent_name = ".".join(name.split(".")[:-1])
         child_name = name.split(".")[-1]
         parent = model.get_submodule(parent_name) if parent_name else model
-        setattr(parent, child_name, static_ln)
+        setattr(parent, child_name, approx_ln)
         replaced.append(name)
 
     return replaced
