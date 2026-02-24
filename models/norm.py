@@ -91,9 +91,11 @@ class ApproxLayerNorm(nn.Module):
         a = var + self.eps
 
         a_scaled = a * self.inv_m
-        y = torch.ones_like(a_scaled)
+        z = a_scaled
+        # First-order Taylor init of 1/sqrt(z) around z=1: y0 ≈ 1 - 0.5*(z-1)
+        y = 1.0 - 0.5 * (z - 1.0)
         for _ in range(self.iters):
-            y = y * (1.5 - 0.5 * a_scaled * y * y)
+            y = y * (1.5 - 0.5 * z * y * y)
 
         inv_sqrt_a = y * self.inv_sqrt_m
         x_norm = c * inv_sqrt_a
@@ -139,7 +141,7 @@ def replace_layernorm_with_approx(
     device: torch.device,
     num_calibration_batches: int = 16,
     eps: float = 1e-6,
-    iters: int = 3,
+    iters: int = 6,
 ) -> List[str]:
     """
     Replace all nn.LayerNorm with ApproxLayerNorm using calibration data.
