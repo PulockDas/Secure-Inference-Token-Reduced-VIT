@@ -9,6 +9,7 @@ LayerNorm approximation for HE inference: replace LayerNorm with a +/*-only appr
 
 from typing import Literal, List, Optional, Tuple
 
+import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -45,69 +46,57 @@ class ApproxLayerNorm(nn.Module):
     """
     HE-friendly LayerNorm approximation using only + and * at inference time.
 
-    We compute per-token mean/variance over the feature dimension (addition/multiplication
-    plus a constant multiply for division by D), then approximate inv_sqrt(var + eps)
-    with a small number of Newton-Raphson iterations:
+    We compute per-token mean/variance over the feature dimension, then use a
+    scaled Newton iteration to approximate 1/sqrt(a) where a = var + eps:
 
-        y_{k+1} = y_k * (1.5 - 0.5 * a * y_k^2),   where a = var + eps
+        a_scaled = a / m
+        y_0 = 1
+        y_{k+1} = y_k * (1.5 - 0.5 * a_scaled * y_k^2)
+        inv_sqrt(a) ≈ y_K * inv_sqrt_m
 
-    This avoids division/sqrt in the forward pass while closely matching LayerNorm
-    if the initialization is calibrated well.
+    Here m = E[a] from calibration; inv_m = 1/m and inv_sqrt_m = 1/sqrt(m)
+    are precomputed in plaintext. At inference, the forward uses only + and *.
     """
 
     def __init__(
         self,
         gamma: torch.Tensor,
         beta: torch.Tensor,
-        inv_sqrt_init: Optional[torch.Tensor] = None,
-        inv_sqrt_poly_coeffs: Optional[torch.Tensor] = None,
-        eps: float = 1e-6,
-        iters: int = 2,
+        inv_m: torch.Tensor,
+        inv_sqrt_m: torch.Tensor,
+        eps: float,
+        iters: int = 3,
     ):
         super().__init__()
         assert gamma.shape == beta.shape and gamma.dim() == 1
         self.register_buffer("gamma", gamma.clone().detach())
         self.register_buffer("beta", beta.clone().detach())
 
-        if inv_sqrt_poly_coeffs is None and inv_sqrt_init is None:
-            raise ValueError("Provide either inv_sqrt_init or inv_sqrt_poly_coeffs.")
-
-        if inv_sqrt_poly_coeffs is not None:
-            coeffs = inv_sqrt_poly_coeffs.clone().detach()
-            if coeffs.dim() != 1:
-                raise ValueError("inv_sqrt_poly_coeffs must be 1D.")
-            self.register_buffer("inv_sqrt_poly_coeffs", coeffs)
-        else:
-            self.register_buffer("inv_sqrt_poly_coeffs", torch.empty(0))
-
-        if inv_sqrt_init is not None:
-            inv_sqrt_init = inv_sqrt_init.clone().detach()
-            if inv_sqrt_init.dim() == 0:
-                inv_sqrt_init = inv_sqrt_init.view(1, 1, 1)
-            self.register_buffer("inv_sqrt_init", inv_sqrt_init)
-        else:
-            self.register_buffer("inv_sqrt_init", torch.empty(0))
+        inv_m = inv_m.clone().detach()
+        inv_sqrt_m = inv_sqrt_m.clone().detach()
+        if inv_m.dim() == 0:
+            inv_m = inv_m.view(1, 1, 1)
+        if inv_sqrt_m.dim() == 0:
+            inv_sqrt_m = inv_sqrt_m.view(1, 1, 1)
+        self.register_buffer("inv_m", inv_m)
+        self.register_buffer("inv_sqrt_m", inv_sqrt_m)
 
         self.eps = float(eps)
         self.iters = int(iters)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mean = x.mean(dim=-1, keepdim=True)
-        centered = x - mean
-        var = (centered * centered).mean(dim=-1, keepdim=True)
+        c = x - mean
+        var = (c * c).mean(dim=-1, keepdim=True)
         a = var + self.eps
 
-        if self.inv_sqrt_poly_coeffs.numel() > 0:
-            coeffs = self.inv_sqrt_poly_coeffs
-            y = coeffs[-1]
-            for c in reversed(coeffs[:-1]):
-                y = y * a + c
-        else:
-            y = self.inv_sqrt_init
+        a_scaled = a * self.inv_m
+        y = torch.ones_like(a_scaled)
         for _ in range(self.iters):
-            y = y * (1.5 - 0.5 * a * y * y)
+            y = y * (1.5 - 0.5 * a_scaled * y * y)
 
-        x_norm = centered * y
+        inv_sqrt_a = y * self.inv_sqrt_m
+        x_norm = c * inv_sqrt_a
         return x_norm * self.gamma + self.beta
 
 
@@ -150,14 +139,15 @@ def replace_layernorm_with_approx(
     device: torch.device,
     num_calibration_batches: int = 16,
     eps: float = 1e-6,
-    iters: int = 2,
+    iters: int = 3,
 ) -> List[str]:
     """
     Replace all nn.LayerNorm with ApproxLayerNorm using calibration data.
 
-    Calibration estimates the typical per-token variance (over the feature dim) at the
-    input to each LayerNorm. We use that to choose an initialization for the Newton
-    inv_sqrt iterations. Replacement is then done in-place.
+    Calibration estimates the typical per-token a = var + eps (over the feature
+    dim) at the input to each LayerNorm. From this we derive a scalar m = E[a],
+    and precompute inv_m = 1/m and inv_sqrt_m = 1/sqrt(m) used in a scaled
+    Newton iteration. Replacement is then done in-place.
     """
     ln_names: List[str] = []
     ln_modules: List[nn.LayerNorm] = []
@@ -169,46 +159,23 @@ def replace_layernorm_with_approx(
     if not ln_names:
         return []
 
-    # Fit a small polynomial y0(a) ≈ 1/sqrt(a) for a = var + eps (per token) to
-    # get a good Newton initialization without non-HE ops at inference.
-    # Degree-2 least squares using accumulated moments:
-    # A = [[Σ1,  Σa,   Σa² ],
-    #      [Σa, Σa²,  Σa³ ],
-    #      [Σa²,Σa³,  Σa⁴ ]],  b = [Σt, Σt·a, Σt·a²],  t = 1/sqrt(a)
-    s0 = [0.0 for _ in ln_names]
-    s1 = [0.0 for _ in ln_names]
-    s2 = [0.0 for _ in ln_names]
-    s3 = [0.0 for _ in ln_names]
-    s4 = [0.0 for _ in ln_names]
-    b0 = [0.0 for _ in ln_names]
-    b1 = [0.0 for _ in ln_names]
-    b2 = [0.0 for _ in ln_names]
+    sum_a = [0.0 for _ in ln_names]
+    count_a = [0 for _ in ln_names]
+    sample_x: List[Optional[torch.Tensor]] = [None for _ in ln_names]
     handles = []
 
     def make_hook(idx: int):
         def hook(module: nn.Module, inp: Tuple[torch.Tensor, ...]) -> None:
             x = inp[0] if isinstance(inp[0], torch.Tensor) else inp[0][0]
-            # Per-token variance over feature dim
             with torch.no_grad():
-                m = x.mean(dim=-1, keepdim=True)
-                c = x - m
-                a = (c * c).mean(dim=-1) + eps  # (B, N)
-                t = a.rsqrt()  # plaintext calibration only
-
-                a1 = a
-                a2 = a1 * a1
-                a3 = a2 * a1
-                a4 = a2 * a2
-
-                s0[idx] += float(a1.numel())
-                s1[idx] += float(a1.sum().detach().cpu().item())
-                s2[idx] += float(a2.sum().detach().cpu().item())
-                s3[idx] += float(a3.sum().detach().cpu().item())
-                s4[idx] += float(a4.sum().detach().cpu().item())
-
-                b0[idx] += float(t.sum().detach().cpu().item())
-                b1[idx] += float((t * a1).sum().detach().cpu().item())
-                b2[idx] += float((t * a2).sum().detach().cpu().item())
+                mean = x.mean(dim=-1, keepdim=True)
+                c = x - mean
+                var = (c * c).mean(dim=-1, keepdim=True)
+                a = var + eps  # (B, N, 1)
+                sum_a[idx] += float(a.sum().detach().cpu().item())
+                count_a[idx] += int(a.numel())
+                if sample_x[idx] is None:
+                    sample_x[idx] = x.detach()[:1].to(device)
 
         return hook
 
@@ -229,31 +196,43 @@ def replace_layernorm_with_approx(
         h.remove()
 
     replaced: List[str] = []
+    did_diag = False
     for idx, name in enumerate(ln_names):
         ln = ln_modules[idx]
-        if s0[idx] <= 0:
+        if count_a[idx] <= 0:
             continue
 
-        A = torch.tensor(
-            [
-                [s0[idx], s1[idx], s2[idx]],
-                [s1[idx], s2[idx], s3[idx]],
-                [s2[idx], s3[idx], s4[idx]],
-            ],
-            dtype=torch.float64,
-        )
-        bb = torch.tensor([b0[idx], b1[idx], b2[idx]], dtype=torch.float64)
-        ridge = (1e-6 * s0[idx]) if s0[idx] > 0 else 1e-6
-        A = A + torch.eye(3, dtype=torch.float64) * ridge
-        coeffs = torch.linalg.solve(A, bb).to(dtype=torch.float32, device=device)
+        m = sum_a[idx] / float(count_a[idx])
+        inv_m = torch.tensor(1.0 / m, device=device)
+        inv_sqrt_m = torch.tensor(1.0 / math.sqrt(m), device=device)
 
         approx_ln = ApproxLayerNorm(
             gamma=ln.weight.detach(),
             beta=ln.bias.detach(),
-            inv_sqrt_poly_coeffs=coeffs,
-            eps=eps,
+            inv_m=inv_m,
+            inv_sqrt_m=inv_sqrt_m,
+            eps=ln.eps if hasattr(ln, "eps") else eps,
             iters=iters,
         ).to(device=device)
+
+        print(f"[ApproxLN] layer '{name}': mean(var+eps) m = {m:.6e}")
+
+        if not did_diag and sample_x[idx] is not None:
+            x_sample = sample_x[idx]
+            with torch.no_grad():
+                y_true = ln(x_sample.to(device))
+                y_apx = approx_ln(x_sample.to(device))
+                rel_err = (
+                    (y_true - y_apx).pow(2).mean().sqrt()
+                    / (y_true.pow(2).mean().sqrt() + 1e-8)
+                ).item()
+                print(
+                    f"[ApproxLN] diagnostic for layer '{name}': "
+                    f"rel_err={rel_err:.6e}, "
+                    f"true_std={y_true.std().item():.6e}, "
+                    f"approx_std={y_apx.std().item():.6e}"
+                )
+            did_diag = True
 
         parent_name = ".".join(name.split(".")[:-1])
         child_name = name.split(".")[-1]
