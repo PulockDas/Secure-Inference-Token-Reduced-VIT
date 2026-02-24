@@ -49,9 +49,10 @@ Secure ViT inference under **CKKS homomorphic encryption (TenSEAL)**: train a pl
 | 5 | Student training with LayerNorm, no cubic-squash | Done |
 | 6 | Student ViT (patch embed, token red, HE attn, MLP), 92%+ saved on Drive | Done |
 | 7 | Knowledge distillation (KL + optional CE, T=4, logits std logging) | Done |
-| 8 | **Approximate activations and LayerNorm for HE** | Pending |
-| 9 | **Encrypted forward (TenSEAL CKKS, single image)** | Pending |
-| 10 | **Per-K results, plots/tables for paper manuscript** | Pending |
+| 8 | **HE-friendly LayerNorm approximation (ApproxLayerNorm + calibration + diagnostics)** | In progress |
+| 9 | **Fine-tune student with approximations active (KD + CE, low LR)** | Planned |
+| 10 | **Encrypted forward (TenSEAL CKKS, single image)** | Pending |
+| 11 | **Per-K results, plots/tables for paper manuscript** | Pending |
 
 ---
 
@@ -61,11 +62,15 @@ Secure ViT inference under **CKKS homomorphic encryption (TenSEAL)**: train a pl
 - **Teacher**: `models/teacher.py` – `get_teacher_vit(num_classes)`. Train: `training/train_teacher.py`; eval: `load_teacher_checkpoint`, `evaluate_teacher`; results under `results/teacher/`.
 - **Token reduction**: `models/token_reduction.py` – `TokenReduction(dim, num_output_tokens)`; (B,N,D)→(B,K,D).
 - **HE attention**: `models/he_attention.py` – `HEAttention`. Used without bounded/cubic-squash in current student training.
-- **Activations**: `models/activations.py` – e.g. PolynomialGELU; student trained with standard choices (no cubic-squash requirement for training).
-- **Norm**: `models/norm.py` – `create_norm("none"|"affine"|"layernorm", dim)`. **Training uses LayerNorm**; HE path will use approximations.
+- **Activations**: `models/activations.py` – e.g. PolynomialGELU; student uses polynomial GELU which is already HE-friendly.
+- **Norm**: `models/norm.py` – `create_norm("none"|"affine"|"layernorm", dim)` and `ApproxLayerNorm` + `replace_layernorm_with_approx`. **Training uses LayerNorm**; for HE we replace `nn.LayerNorm` with `ApproxLayerNorm` (scaled-Newton inverse sqrt, calibrated once from data, +/× only) and log diagnostics (relative LN error, stds).
 - **Student**: `models/student.py` – `StudentViT`, `get_student_vit`. Patch embed → CLS+patches → token reduction → blocks → head. Trained with LayerNorm; checkpoint (92%+) on Drive.
 - **Distillation**: `training/train_student.py` – `train_student`, distillation loss, `load_student_checkpoint`. Notebook: load with `norm_mode="layernorm"` to match saved checkpoint.
-- **Notebooks**: `notebooks/fine-tune-teacher.ipynb`, `notebooks/distill-student.ipynb` (Drive, train student, save ckpt, push logs/results).
+- **Notebooks**:
+  - `notebooks/fine-tune-teacher.ipynb` – teacher fine-tuning.
+  - `notebooks/distill-student.ipynb` (Drive) – original student distillation.
+  - `notebooks/he-inference-student.ipynb` – load distilled student, replace LayerNorm with `ApproxLayerNorm`, run plaintext evaluation + diagnostics (current ApproxLN drops accuracy to ~0.28 test acc; still being improved).
+  - `notebooks/fine-tune-student-approx.ipynb` – new Colab notebook to fine-tune the student **with approximations active** (ApproxLayerNorm, HE attention, polynomial GELU) using low LR KD + CE, and save a new HE-friendly student checkpoint + logs/results on Drive.
 
 ---
 
@@ -77,8 +82,11 @@ Secure ViT inference under **CKKS homomorphic encryption (TenSEAL)**: train a pl
 
 ## HE Inference (Planned)
 
-- **Plaintext student**: already at 92%+ with LayerNorm and current attention/activations.
-- **Encrypted forward**: replace LayerNorm and non-polynomial activations with **HE-suitable approximations** (polynomial or +/× only) so that:
+- **Plaintext student (baseline)**: already at 92%+ with LayerNorm and current attention/activations.
+- **Plaintext student with approximations**:
+  - Replace LayerNorm with `ApproxLayerNorm` (scaled-Newton, +/× only) everywhere and keep HE-friendly activations/attention.
+  - Currently, a naive swap causes a **large accuracy drop** (~0.28 test acc). The next step is to **fine-tune this ApproxLayerNorm student** with the original KD setup (AdamW, LR 5e-6, ~5 epochs, T=4, alpha=0.7) to recover accuracy while keeping approximations fixed (no recalibration).
+- **Encrypted forward**: once the ApproxLayerNorm student recovers to near-baseline accuracy, implement CKKS encrypted forward with these approximations so that:
   - CKKS circuit uses only supported ops.
   - Accuracy stays at same level (92%+), with some **extra time** for HE; measure and report for the paper.
 - **K sweep**: run with K = 97 first, then other K values; generate **plots and tables** for the manuscript.
