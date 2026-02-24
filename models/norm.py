@@ -113,9 +113,11 @@ def replace_layernorm_with_static(
     """
     Replace all nn.LayerNorm in model with StaticLayerNorm using calibration data.
 
-    Runs calibration batches through the model, captures inputs to each LayerNorm,
-    computes μ_fixed and σ_fixed^2 per layer, then precomputes scale and bias so
-    LN becomes y = scale * x + bias. Replaces layers in place.
+    Runs calibration batches through the model, captures (input, output) pairs for
+    each LayerNorm, and for every feature dimension solves a 1D least-squares fit
+    y ≈ scale * x + bias over the collected data. The fitted (scale, bias) are
+    then frozen into StaticLayerNorm so that inference uses only + and * while
+    closely mimicking the original LayerNorm on the calibration distribution.
 
     Returns:
         List of replaced module names (e.g. ["blocks.0.norm1", "blocks.0.norm2", ...]).
@@ -131,19 +133,20 @@ def replace_layernorm_with_static(
     if not ln_names:
         return []
 
-    # Capture inputs to each LayerNorm via forward hooks
-    captured: List[List[torch.Tensor]] = [[] for _ in ln_names]
+    # Capture inputs and outputs for each LayerNorm via forward hooks
+    inputs_per_ln: List[List[torch.Tensor]] = [[] for _ in ln_names]
+    outputs_per_ln: List[List[torch.Tensor]] = [[] for _ in ln_names]
     handles = []
 
     def make_hook(idx: int):
-        def hook(module: nn.Module, inp: Tuple[torch.Tensor, ...]) -> None:
-            # Pre-hook: only (module, args); no output yet
+        def hook(module: nn.Module, inp: Tuple[torch.Tensor, ...], out: torch.Tensor) -> None:
             x = inp[0] if isinstance(inp[0], torch.Tensor) else inp[0][0]
-            captured[idx].append(x.detach())
+            inputs_per_ln[idx].append(x.detach())
+            outputs_per_ln[idx].append(out.detach())
         return hook
 
     for idx, (name, module) in enumerate(zip(ln_names, ln_modules)):
-        handles.append(module.register_forward_pre_hook(make_hook(idx)))
+        handles.append(module.register_forward_hook(make_hook(idx)))
 
     model.eval()
     batch_count = 0
@@ -158,21 +161,41 @@ def replace_layernorm_with_static(
     for h in handles:
         h.remove()
 
-    # For each LayerNorm: concat captured inputs, compute μ and σ^2 over (batch, seq), then scale/bias
+    # For each LayerNorm: concat captured inputs/outputs and fit per-feature affine map
     replaced: List[str] = []
+    tiny = 1e-8
     for idx, name in enumerate(ln_names):
         ln = ln_modules[idx]
-        inputs_list = captured[idx]
-        if not inputs_list:
+        xs = inputs_per_ln[idx]
+        ys = outputs_per_ln[idx]
+        if not xs or not ys:
             continue
-        # (B, N, D) each; concat along batch
-        all_x = torch.cat(inputs_list, dim=0)
-        # μ, var over dims (0, 1) -> (D,)
-        mu = all_x.mean(dim=(0, 1))
-        var = all_x.var(dim=(0, 1), unbiased=False)
-        gamma = ln.weight.detach()
-        beta = ln.bias.detach()
-        scale, bias = _compute_static_ln_scale_bias(gamma, beta, mu, var, eps=eps)
+
+        all_x = torch.cat(xs, dim=0)  # (B_total, N, D)
+        all_y = torch.cat(ys, dim=0)  # (B_total, N, D)
+        B_total, N, D = all_x.shape
+
+        x_flat = all_x.view(B_total * N, D)
+        y_flat = all_y.view(B_total * N, D)
+
+        # Linear regression y ≈ scale * x + bias (per feature)
+        mu_x = x_flat.mean(dim=0)
+        mu_y = y_flat.mean(dim=0)
+        x_centered = x_flat - mu_x
+        y_centered = y_flat - mu_y
+
+        var_x = (x_centered * x_centered).mean(dim=0)
+        cov_xy = (x_centered * y_centered).mean(dim=0)
+
+        scale = cov_xy / (var_x + eps)
+        # Guard against near-constant inputs
+        mask_bad = var_x < tiny
+        if mask_bad.any():
+            scale = scale.clone()
+            scale[mask_bad] = 1.0
+
+        bias = mu_y - scale * mu_x
+
         static_ln = StaticLayerNorm(scale, bias)
         static_ln.to(device=device)
 
