@@ -7,7 +7,7 @@ import csv
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -282,3 +282,122 @@ def load_student_checkpoint(
     if load_result.unexpected_keys:
         print("Load checkpoint: unexpected keys (ignored):", load_result.unexpected_keys)
     return student.to(device)
+
+
+def train_student_with_approx(
+    student: nn.Module,
+    teacher: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    epochs: int = 5,
+    lr: float = 5e-6,
+    temperature: float = 4.0,
+    alpha: float = 0.7,
+) -> Dict[str, Any]:
+    """
+    Light recovery fine-tuning for HE-friendly student:
+
+    - Teacher is frozen and exact (no approximations).
+    - Student already has ApproxLayerNorm and other HE-friendly ops active.
+    - Loss = 0.3 * CE + 0.7 * KD with T=4 (same setup as original distillation).
+
+    Returns:
+        dict with keys: 'student', 'history', 'best_val_acc'.
+    """
+    student = student.to(device)
+    teacher = teacher.to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+
+    optimizer = torch.optim.AdamW(student.parameters(), lr=lr)
+    ce = nn.CrossEntropyLoss()
+
+    history: List[Dict[str, Any]] = []
+    best_val_acc = 0.0
+    best_state = None
+    stable_epochs = 0
+
+    for epoch in range(epochs):
+        student.train()
+        running_loss = 0.0
+        total, correct = 0, 0
+        num_batches = 0
+
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+
+            with torch.no_grad():
+                teacher_logits = teacher(images)
+
+            student_logits = student(images)
+
+            soft_loss = distillation_loss(student_logits, teacher_logits, temperature)
+            hard_loss = ce(student_logits, labels)
+            loss = alpha * soft_loss + (1.0 - alpha) * hard_loss
+
+            if not torch.isfinite(loss):
+                continue
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            running_loss += loss.item()
+            preds = student_logits.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            num_batches += 1
+
+        train_loss = running_loss / max(1, num_batches)
+        train_acc = correct / max(1, total)
+
+        # Validation accuracy + per-class accuracy
+        from .train_teacher import evaluate_teacher  # local import to avoid cycle at module import time
+
+        val_result = evaluate_teacher(
+            student,
+            val_loader,
+            device,
+            train_loader.dataset.class_names,  # same dataset as training
+            results_dir=None,
+            results_subdir="student_approx_val",
+        )
+        val_acc = val_result["test_acc"]
+        per_class_acc = val_result["per_class_acc"]
+
+        print(
+            f"Epoch {epoch+1}/{epochs}  "
+            f"train_loss={train_loss:.4f}  train_acc={train_acc:.4f}  "
+            f"val_acc={val_acc:.4f}"
+        )
+        print("  Per-class val acc:", [f"{a:.4f}" for a in per_class_acc])
+
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "train_loss": float(train_loss),
+                "train_acc": float(train_acc),
+                "val_acc": float(val_acc),
+                "per_class_acc": [float(a) for a in per_class_acc],
+            }
+        )
+
+        # Early stopping: stop if val_acc hasn't improved by >= 1e-3 for 2 consecutive epochs
+        if val_acc > best_val_acc + 1e-3:
+            best_val_acc = val_acc
+            best_state = {k: v.cpu().clone() for k, v in student.state_dict().items()}
+            stable_epochs = 0
+        else:
+            stable_epochs += 1
+
+        if epoch >= 2 and stable_epochs >= 2:
+            print("Validation accuracy stabilized; stopping early.")
+            break
+
+    if best_state is not None:
+        student.load_state_dict(best_state)
+
+    return {"student": student, "history": history, "best_val_acc": best_val_acc}
