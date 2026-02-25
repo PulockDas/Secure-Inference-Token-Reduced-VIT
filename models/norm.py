@@ -166,6 +166,9 @@ def replace_layernorm_with_approx(
     if not ln_names:
         return []
 
+    # Use each LayerNorm's own eps to keep calibration consistent with its forward pass.
+    layer_eps = [ln.eps if hasattr(ln, "eps") else eps for ln in ln_modules]
+
     sum_a = [0.0 for _ in ln_names]
     count_a = [0 for _ in ln_names]
     sample_x: List[Optional[torch.Tensor]] = [None for _ in ln_names]
@@ -178,7 +181,7 @@ def replace_layernorm_with_approx(
                 mean = x.mean(dim=-1, keepdim=True)
                 c = x - mean
                 var = (c * c).mean(dim=-1, keepdim=True)
-                a = var + eps  # (B, N, 1)
+                a = var + layer_eps[idx]  # (B, N, 1) — match this LayerNorm's eps exactly
                 sum_a[idx] += float(a.sum().detach().cpu().item())
                 count_a[idx] += int(a.numel())
                 if sample_x[idx] is None:
