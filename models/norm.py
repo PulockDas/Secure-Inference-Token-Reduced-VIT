@@ -91,6 +91,11 @@ class ApproxLayerNorm(nn.Module):
         a = var + self.eps
 
         a_scaled = a * self.inv_m
+        # During training, clamp the scaled variance to avoid exploding/vanishing
+        # Newton iterations (no clamp in eval/inference to keep HE behavior intact).
+        if self.training:
+            a_scaled = torch.clamp(a_scaled, 1e-3, 1e3)
+
         z = a_scaled
         # First-order Taylor init of 1/sqrt(z) around z=1: y0 ≈ 1 - 0.5*(z-1)
         y = 1.0 - 0.5 * (z - 1.0)
